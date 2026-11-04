@@ -142,55 +142,12 @@ select dbms_metadata.get_ddl('TABLE', table_name, 'K2') from all_tables
 
 ---
 
-## C. Исправления харнесса
+## C. Харнесс
 
-### C1. Порядок регистрации ПТ
-
-```lua
--- resetState: долг обнулять, а не выставлять
-for _, r in ipairs(sc.reqs or {}) do
-    ex([[update k2req_group set debt = 0
-          where id = (select group_id from k2req where id = ?)]], s(r.id))
-    -- статус как раньше
-end
-
-STEPS.register_pt = function(api, sc, ctx, st)
-    api.beforePtRegister(s(sc.acc_id))       -- фиксирует остаток typ=1
-    for _, r in ipairs(sc.reqs or {}) do     -- затем «регистрируется» ПТ
-        ex([[update k2req_group set debt = ?
-              where id = (select group_id from k2req where id = ?)]], s(r.debt), s(r.id))
-    end
-end
-```
-
-### C2. Инварианты на лимит и сверку остатка
-
-Добавить в `checkInvariants`; лимитные проверки выполнять только после шага
-`update_limit` (передать `st.op` в функцию).
-
-```lua
-if op == 'update_limit' then
-    local bankHeld = snap.f_b + snap.l_o + snap.l_b + snap.l_c
-    if snap.abs_lim + EPS < bankHeld then
-        table.insert(v, 'лимит АБС ' .. s(snap.abs_lim) ..
-            ' меньше доли банка и арестованного ' .. s(r2(bankHeld)))
-    end
-    if snap.abs_lim > snap.abs_bal - snap.f_c + EPS then
-        table.insert(v, 'лимит АБС ' .. s(snap.abs_lim) ..
-            ' блокирует защищённую долю клиента f_c=' .. s(snap.f_c))
-    end
-end
-local diff = r2(snap.abs_bal - anlTotal)
-if math.abs(diff) > EPS then
-    table.insert(v, 'остаток АБС не разложен по корзинам, разница ' .. s(diff))
-end
-```
-
-### C3. Ожидания двух видов
-
-В сценарии держать `expect` (правильно по бизнес-правилам) и `expect_current`
-(текущее поведение пакета). В отчёте выводить оба результата. Пока пакет не исправлен,
-ожидаемо: `expect_current` проходит, `expect` падает.
+Реализован в `harness/k2calc_test.lua` (описание — `harness/README.md`): порядок
+`register_pt`, история месяца (`seed_anl`, `mzp_covered`), траты клиента (`abs_spend`),
+режим W4 без подъёма лимита, инварианты лимита и сверки с учётом необработанных
+поступлений, `expect` / `expect_current`, fuzz.
 
 ---
 
@@ -284,17 +241,22 @@ if tonumber(dup.cnt or 0) > 0 then return end
 ### D5. Необработанные поступления и сверка (Д5)
 
 - `lockedIncomes` считать по записям `k2income_log` без строки в `k2anl_income`
-  (запрос A5), а не через `accLim − limit_nat`.
+  (запрос A5, либо по полю `proccessed`), а не через `accLim − limit_nat`. Для W4
+  получение лимита возвращает `limit_nat`, поэтому разница всегда 0 и необработанное
+  поступление при сверке с остатком «растворяется» в старой `f_c` (механизм INC-1).
+- В `updateAnls` вычитать из корзин только `accBal − необработанные − oldBal`, чтобы
+  деньги ещё не зарегистрированного перевода не списывали устаревшую `f_c`.
 - Для зависших счетов: найти такие записи, повторно выполнить `onIncomeEvent` (с D3
   это безопасно), затем `updateLimit`.
 - Регулярная сверка `limit_nat` с лимитом АБС с алертом при расхождении.
 
 ### D6. Блокировка и подпроцессы (Д6)
 
-Проверить, в какой сессии выполняются `k2acc_getbal_sys` и `k2acc_get_lim_sys`. Если в
-отдельной и они обращаются к строке `k2acc`, получать баланс и лимит **до**
-`for update` и передавать внутрь, либо обрабатывать события одного счёта строго
-последовательно.
+В INC-1 не участвовал. Командой уже поставлена проверка: следующая обработка
+поступления по счёту не запускается, пока не завершилась предыдущая. Остаётся
+проверить, в какой сессии выполняются `k2acc_getbal_sys` и `k2acc_get_lim_sys` и не
+снимается ли блокировка `for update` при их вызове. Проверку очереди тестировать двумя
+параллельными вызовами REST-сервиса автотеста на одном счёте.
 
 ### D7. Мелкие исправления
 
@@ -304,16 +266,21 @@ if tonumber(dup.cnt or 0) > 0 then return end
 - `found`, `errText`, `errNum`, `typp` объявить `local`.
 - В `onIncomeEvent` проверять ошибку `update k2acc set cldepositarrested`.
 - `getAnlIncomeBankPart` не ограничивать сумму банковской долей первой строки.
-- `getAccBal`: `if errNum==0 and found and found.cldepositarrested ~= nil then`.
+- `getAccBal` (доработка): пустая выборка даёт `errNum = 2`, но при
+  `cldepositarrested = 0` (а не null) функция вернёт 0 вместо остатка АБС — так у счёта
+  INC-1 (поле 0 при остатке 269,20). Вернуть получение остатка из АБС или убедиться, что
+  `cldepositarrested` всегда равен реальному остатку.
 - `syncAnl`: убрать необъявленные глобальные `systm`, `prdct`.
 
 ---
 
 ## E. Порядок внедрения
 
-1. Разовая сверка зависших счетов (D5) и идемпотентность (D3).
-2. Построчное деление и read-only расчёт (D1, D2) вместе с резервированием (D4): без
-   резервирования построчное деление не защищает от двойного списания.
-3. Блокировки (D6) и мелкие исправления (D7).
+1. **Д1** (D1/D2): база 50% — только новые поступления, без `f_c`. Само по себе
+   устраняет переплату INC-1.
+2. **Д5** (D5): учёт необработанных поступлений по `k2income_log`; разовая сверка
+   зависших счетов; идемпотентность (D3).
+3. Повтор установки лимита при «Exists waiting document» (по итогам INC-2).
+4. Резервирование платежа (D4), блокировки (D6), мелкие исправления (D7).
 
 После каждого шага прогонять все кейсы автотеста.
